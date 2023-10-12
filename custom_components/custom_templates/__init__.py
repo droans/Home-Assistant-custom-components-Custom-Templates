@@ -1,5 +1,6 @@
 import asyncio
 from collections import ChainMap
+import colorsys
 import logging
 from typing import Any, Callable
 
@@ -14,13 +15,13 @@ from homeassistant.loader import bind_hass
 from .const import (DOMAIN, CUSTOM_TEMPLATES_SCHEMA, CONF_PRELOAD_TRANSLATIONS, CONST_EVAL_FUNCTION_NAME,
                     CONST_STATE_TRANSLATED_FUNCTION_NAME, CONST_STATE_ATTR_TRANSLATED_FUNCTION_NAME,
                     CONST_TRANSLATED_FUNCTION_NAME, CONST_ALL_TRANSLATIONS_FUNCTION_NAME, 
+                    CONST_HLS_TO_RGB_NAME, CONST_RGB_TO_HLS_NAME,
                     DEFAULT_UNAVAILABLE_STATES, CONST_IS_AVAILABLE_FUNCTION_NAME)
 
 _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = CUSTOM_TEMPLATES_SCHEMA
 ConfigType = dict[str, Any]
-
 
 class TranslatableTemplate:
 
@@ -31,6 +32,109 @@ class TranslatableTemplate:
     def validate_language(self, language):
         if language not in self._available_languages:
             raise TemplateError(f"Language {language} is not loaded")  # type: ignore[arg-type]
+
+class ConvertColorSystem:
+    def __init__(self, hass: HomeAssistant):
+        self._hass = hass
+    def __call__(self, fr: str, to: str, *colors):
+        '''
+        First ensure the colors received are float and that the correct number of values are received,
+            then convert all values to RGB,
+            finally change values to the proper system
+        '''
+        color_mapping = {
+            'rgb': {
+                'values': 3,
+                'from': self._from_rgb,
+                'to': self._to_rgb
+            },
+            'hs': {
+                'values': 2,
+                'from': self._from_hs,
+                'to': self._to_hs
+            },
+            'hls': {
+                'values': 3,
+                'from': colorsys.hls_to_rgb,
+                'to': colorsys.rgb_to_hls
+            },
+            'hsv': {
+                'values': 3,
+                'from': colorsys.hsv_to_rgb,
+                'to': colorsys.rgb_to_hsv
+            },
+            'yiq': {
+                'values': 3,
+                'from': colorsys.yiq_to_rgb,
+                'to': colorsys.rgb_to_yiq
+            },
+        }
+        colors = self._convert_if_not_floats(colors)
+        if fr not in color_mapping:
+            raise TemplateError(f"Unrecognized color conversion type for from: {fr}.")
+        if to not in color_mapping:
+            raise TemplateError(f"Unrecognized color conversion type for to: {to}.")
+        color_len = color_mapping.get(fr).get('values')
+        from_func = color_mapping.get(fr).get('from')
+        to_func = color_mapping.get(to).get('to')
+        if len(colors) != color_len:
+            raise TemplateError(f"Color conversion from {fr} requires {color_len} values, received {len(colors)}.")
+        rgb = from_func(*colors)
+        result = to_func(*rgb)
+        return list(result)
+
+    def _convert_if_not_floats(self, colors):
+        '''
+        First check if values can be converted to float, otherwise raise error.
+        If any value is over 1.0, we assume we received bytes instead of a float between 0 and 1.0 and convert it.
+        '''
+        if len(colors) == 1 and type(colors[0]) in [set, tuple, list]:
+            colors = colors[0]
+        try:
+            colors = [float(color) for color in colors]
+        except ValueError:
+            raise TemplateError(f"Expected either int or float for colors, received {type(color)}.")
+            
+        if sum([color > 1 for color in colors]):
+            result = [color/ 255.0 for color in colors]
+        else:
+            result = colors
+        return result
+
+    def _from_rgb(self, *rgb):
+        if len(rgb) == 1:
+            rgb = list(rgb[0])
+        else:
+            rgb = list(rgb)
+        return rgb
+
+    def _from_hs(self, *hs):
+        '''
+        Convert to hsv by setting value to 1.0
+        '''
+        if len(hs) == 1:
+            hs = list(hs[0])
+        else:
+            hs = list(hs)
+        hs.append(1.0)
+        rgb = colorsys.hsv_to_rgb(*hs)
+        return rgb
+
+    def _to_rgb(self, *rgb):
+        if len(rgb) == 1:
+            rgb = list(rgb[0])
+        else:
+            rgb = list(rgb)
+        return rgb
+
+    def _to_hs(self, *rgb):
+        if len(rgb) == 1:
+            rgb = list(rgb[0])
+        else:
+            rgb = list(rgb)
+        hsv = colorsys.rgb_to_hsv(*rgb)
+        hs = hsv[:-1]
+        return hs
 
 class IsAvailable():
     def __init__(self, hass: HomeAssistant):
@@ -279,6 +383,7 @@ def setup(hass: HomeAssistant, config: ConfigType):
     all_translations_template = AllTranslations(hass, languages)
     eval_template = EvalTemplate(hass)
     is_available = IsAvailable(hass)
+    convert_colors = ConvertColorSystem(hass)
 
     _TranslationCache.ct_patched_get_cached = get_cached
 
@@ -294,11 +399,13 @@ def setup(hass: HomeAssistant, config: ConfigType):
         env.globals[CONST_ALL_TRANSLATIONS_FUNCTION_NAME] = all_translations_template
         env.globals[CONST_EVAL_FUNCTION_NAME] = eval_template
         env.globals[CONST_IS_AVAILABLE_FUNCTION_NAME] = is_available
+        env.globals[CONST_COLOR_CONVERSION_NAME] = convert_colors
         env.filters[CONST_STATE_TRANSLATED_FUNCTION_NAME] = state_translated_template
         env.filters[CONST_STATE_ATTR_TRANSLATED_FUNCTION_NAME] = state_attr_translated_template
         env.filters[CONST_TRANSLATED_FUNCTION_NAME] = translated_template
         env.filters[CONST_EVAL_FUNCTION_NAME] = eval_template
         env.filters[CONST_IS_AVAILABLE_FUNCTION_NAME] = is_available
+        env.filters[CONST_COLOR_CONVERSION_NAME] = convert_colors
 
     def patched_init(
         self: TemplateEnvironment,
